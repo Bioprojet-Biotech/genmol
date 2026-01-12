@@ -92,8 +92,10 @@ torchrun --nproc_per_node ${num_gpu} scripts/train.py hydra.run.dir=${save_dir} 
 Other hyperparameters can be adjusted in `configs/base.yaml`.<br>
 The training used 8 NVIDIA A100 GPUs and took ~5 hours.
 
+We suggest the use of [SAFE dataset V2](https://huggingface.co/datasets/datamol-io/safe-drugs) to train GenMol (Note V2 removes some invalid molecules/corrupted SAFE strings. The original data that was used by GenMol is available here [SAFE dataset V1](https://huggingface.co/datasets/datamol-io/safe-gpt/tree/b83175cd7394).
+
 ### (Optional) Training with User-defined Dataset
-We used the [SAFE dataset](https://huggingface.co/datasets/datamol-io/safe-drugs) to train GenMol. To use your own training dataset, first convert your SMILES dataset into SAFE by running the following command:
+To use your own training dataset, first convert your SMILES dataset into SAFE by running the following command:
 ```bash
 python scripts/preprocess_data.py ${input_path} ${data_path}
 ```
