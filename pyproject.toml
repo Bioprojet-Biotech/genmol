@@ -28,7 +28,7 @@ dependencies = [
     'lightning==2.5.1',
     'omegaconf==2.3.0',
     'transformers==4.52.4',
-    'safe-mol==0.1.13',
+    'safe-mol==0.1.14',
     'pytdc==0.4.1',
     'easydict==1.13',
     'openbabel-wheel==3.1.1.22'

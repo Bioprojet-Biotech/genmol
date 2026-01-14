@@ -20,8 +20,6 @@ sys.path.append(os.path.realpath('.'))
 
 import argparse
 import yaml
-import os
-import sys
 from time import time
 from tdc import Oracle
 from scripts.exps.pmo.main.genmol.run import GenMol_Optimizer as Optimizer
