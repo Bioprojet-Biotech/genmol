@@ -71,14 +71,13 @@ if __name__ == '__main__':
             task = 'linker_design'
         
         validity, uniqueness, diversity, distance, quality = [], [], [], [], []
-        for original, fragment in zip(data['smiles'], data[task]):
-            samples = sampling_fn(fragment)
-            if len(samples) == 0:
-                validity.append(0)
-                uniqueness.append(0)
-                quality.append(0)
-                continue
-            df = pd.DataFrame({'smiles': samples, 'qed': oracle_qed(samples), 'sa': oracle_sa(samples)})
+        for name, original, fragment in zip(data['name'], data['smiles'], data[task]):
+            samples=[]
+            for i in range(0, num_samples, batch_size):
+                batch = fragment[i:i+batch_size]
+                samples = samples + sampling_fn(batch)
+            
+            df = pd.DataFrame({ 'name': [name] * len(samples), 'smiles': samples, 'qed': oracle_qed(samples), 'sa': oracle_sa(samples), "ref_smiles": [original] * len(samples)})
             validity.append(len(df['smiles']) / num_samples)
             df = df.drop_duplicates('smiles')
             uniqueness.append(len(df['smiles']) / len(samples))
@@ -87,14 +86,14 @@ if __name__ == '__main__':
             else:
                 diversity.append(evaluator(df['smiles']))
             distance.append(get_distance(original, df))
-            df = df[df['qed'] >= 0.6]
-            df = df[df['sa'] <= 4]
-            quality.append(len(df) / num_samples)
+        
+            quality.append(len(df[(df['qed'] >= 0.6) & (df['sa'] <= 4)]) / num_samples)
 
-        print(f'{task}')
-        print(f'\tValidity:\t{np.mean(validity)}')
-        print(f'\tUniqueness:\t{np.mean(uniqueness)}')
-        print(f'\tDiversity:\t{np.mean(diversity)}')
-        print(f'\tDistance:\t{np.mean(distance)}')
-        print(f'\tQuality:\t{np.mean(quality)}')
-        print('-' * 50)
+            print(f'{task}')
+            print(f'\tValidity:\t{np.mean(validity)}')
+            print(f'\tUniqueness:\t{np.mean(uniqueness)}')
+            print(f'\tDiversity:\t{np.mean(diversity)}')
+            print(f'\tDistance:\t{np.mean(distance)}')
+            print(f'\tQuality:\t{np.mean(quality)}')
+            print('-' * 50)
+            df[['name', 'smiles', 'qed', 'sa', 'ref_smiles']].to_csv(f'results/{name}_{task}.csv', index=False)

@@ -31,7 +31,7 @@ dependencies = [
     'safe-mol==0.1.14',
     'pytdc==0.4.1',
     'easydict==1.13',
-    'openbabel-wheel==3.1.1.22'
+    'openbabel-wheel==3.1.1.22',
 ]
 
 [tool.setuptools.packages.find]
