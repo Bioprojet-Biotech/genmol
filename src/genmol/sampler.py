@@ -166,26 +166,53 @@ class Sampler:
             return filter_by_substructure(samples, fragment)
         return samples
 
-    def mask_modification(self, smiles, min_len=30, **kwargs):
+    def _safe_fragment_indices_matching(self, smiles, protected_smiles):
+        """Return SAFE fragment indices whose decoded SMILES overlap *protected_smiles*."""
+        encoded = sf.SAFEConverter(slicer=self.slicer, ignore_stereo=True).encoder(
+            smiles, allow_empty=True,
+        )
+        protected = Chem.MolFromSmiles(protected_smiles)
+        if protected is None:
+            return set()
+        protected_idx = set()
+        for i, frag in enumerate(encoded.split('.')):
+            frag_smi = sf.decode(frag, canonical=True, ignore_errors=True)
+            if frag_smi is None:
+                continue
+            frag_mol = Chem.MolFromSmiles(frag_smi)
+            if frag_mol is None:
+                continue
+            if (
+                frag_mol.HasSubstructMatch(protected)
+                or protected.HasSubstructMatch(frag_mol)
+            ):
+                protected_idx.add(i)
+        return protected_idx
+
+    def mask_modification(self, smiles, min_len=30, protected_smiles=None, **kwargs):
         encoded_smiles = sf.SAFEConverter(slicer=self.slicer, ignore_stereo=True).encoder(smiles, allow_empty=True)
         x = self.model.tokenizer([encoded_smiles],
                                   return_tensors='pt',
                                   truncation=True,
                                   max_length=self.model.config.model.max_position_embeddings)['input_ids']
+        if protected_smiles is not None:
+            kwargs['protected_smiles'] = protected_smiles
         if x.shape[-1] < min_len:
             return self.addmask(smiles, num_edit=min_len-x.shape[-1]+1, **kwargs)
         return self.remask(smiles, input_ids=x, **kwargs)
 
-    def addmask(self, smiles, num_edit=3, **kwargs):
+    def addmask(self, smiles, num_edit=3, protected_smiles=None, **kwargs):
         try:
             samples = self.fragment_completion(smiles, mask_len=num_edit, apply_filter=False, **kwargs)
         except:
             return smiles
+        if protected_smiles is not None and samples:
+            samples = filter_by_substructure(samples, protected_smiles)
         if samples:
             return samples[0]
         return smiles
     
-    def remask(self, smiles, input_ids=None, **kwargs):
+    def remask(self, smiles, input_ids=None, protected_smiles=None, **kwargs):
         x = input_ids
         if x is None:
             encoded_smiles = sf.SAFEConverter(slicer=self.slicer, ignore_stereo=True).encoder(smiles, allow_empty=True)
@@ -196,7 +223,15 @@ class Sampler:
         
         # fragment mask replacement
         special_token_idx = [0] + (x[0] == self.dot_index).nonzero(as_tuple=True)[0].tolist() + [len(x[0]) - 1]
-        frag_idx = random.randint(0, len(special_token_idx) - 2)
+        n_frags = len(special_token_idx) - 1
+        if protected_smiles is not None:
+            protected_idx = self._safe_fragment_indices_matching(smiles, protected_smiles)
+            candidates = [i for i in range(n_frags) if i not in protected_idx]
+            if not candidates:
+                return smiles
+            frag_idx = random.choice(candidates)
+        else:
+            frag_idx = random.randint(0, n_frags - 1)
         mask_start_idx = special_token_idx[frag_idx] + 1
         mask_end_idx = special_token_idx[frag_idx + 1]
         num_insert_mask = random.randint(5, 15)

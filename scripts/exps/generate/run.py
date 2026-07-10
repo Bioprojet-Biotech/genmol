@@ -83,8 +83,6 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run GenMol generation (motif_extension, scaffold_decoration, superstructure_generation)."
     )
-    parser.add_argument('--protein', type=str, default=None,
-                        help="Target PDB file (for pipeline compatibility; not used by sampler).")
     parser.add_argument('--ref_ligand', type=str, required=True,
                         help="Target ligand file (SMILES or .smi/.csv/.mol/.sdf).")
     parser.add_argument('--output', type=str, required=True,

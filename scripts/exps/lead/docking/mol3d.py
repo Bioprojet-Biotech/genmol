@@ -67,6 +67,19 @@ def smiles_from_mol_3d(path):
     return smiles_from_mol(load_mol_3d(path))
 
 
+def mol_contains_core(smiles, core_mol):
+    """Return True if *smiles* is compatible with *core_mol* for constrained embedding.
+
+    Uses the same criterion as constrained_embed_smiles: the molecule contains the
+    core as a substructure, or the core contains the molecule.
+    """
+    mol = Chem.MolFromSmiles(smiles) if isinstance(smiles, str) else smiles
+    if mol is None:
+        return False
+    core = Chem.RemoveHs(Chem.Mol(core_mol))
+    return mol.GetSubstructMatch(core) != () or core.GetSubstructMatch(mol) != ()
+
+
 def constrained_embed_smiles(smiles, core_mol, random_seed=0):
     """
     Embed a SMILES molecule in 3D while matching the core substructure coordinates.
@@ -77,7 +90,7 @@ def constrained_embed_smiles(smiles, core_mol, random_seed=0):
     if mol is None:
         raise ValueError(f'Invalid SMILES: {smiles}')
 
-    core = Chem.Mol(core_mol)
+    core = Chem.RemoveHs(Chem.Mol(core_mol))
     if mol.GetSubstructMatch(core) == () and core.GetSubstructMatch(mol) == ():
         raise ValueError(
             'SMILES does not contain the core substructure used for constrained embedding'
@@ -91,6 +104,103 @@ def constrained_embed_smiles(smiles, core_mol, random_seed=0):
         randomseed=random_seed,
     )
     return Chem.RemoveHs(embedded)
+
+
+def subset_mol_preserve_conformer(mol, atom_indices, conf_id=0):
+    """Build a sub-mol with selected atoms and 3D positions copied from *mol*."""
+    if not atom_indices:
+        raise ValueError('atom_indices is empty')
+    atom_indices = sorted(set(atom_indices))
+    if mol.GetNumConformers() == 0:
+        raise ValueError('Molecule has no conformer')
+    em = Chem.RWMol(Chem.Mol())
+    old_to_new = {}
+    for old_i in atom_indices:
+        new_i = em.AddAtom(mol.GetAtomWithIdx(old_i))
+        old_to_new[old_i] = new_i
+    for bond in mol.GetBonds():
+        a = bond.GetBeginAtomIdx()
+        b = bond.GetEndAtomIdx()
+        if a in old_to_new and b in old_to_new:
+            em.AddBond(old_to_new[a], old_to_new[b], bond.GetBondType())
+    out = em.GetMol()
+    ref_conf = mol.GetConformer(conf_id)
+    new_conf = Chem.Conformer(out.GetNumAtoms())
+    for old_i in atom_indices:
+        new_i = old_to_new[old_i]
+        new_conf.SetAtomPosition(new_i, ref_conf.GetAtomPosition(old_i))
+    out.RemoveAllConformers()
+    out.AddConformer(new_conf, assignId=True)
+    return out
+
+
+def query_mol_from_smiles(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f'Invalid SMILES: {smiles}')
+    return Chem.RemoveHs(mol)
+
+
+def find_substructure_atom_indices(mol, smiles, match_index=0, use_chirality=True):
+    """Return atom indices in *mol* that match the SMILES substructure."""
+    query = query_mol_from_smiles(smiles)
+    matches = mol.GetSubstructMatches(query, uniquify=True, useChirality=use_chirality)
+    if not matches and use_chirality:
+        matches = mol.GetSubstructMatches(query, uniquify=True, useChirality=False)
+    if not matches:
+        raise ValueError(f'SMILES substructure not found in molecule: {smiles}')
+    if match_index < 0 or match_index >= len(matches):
+        raise ValueError(
+            f'match_index {match_index} out of range (found {len(matches)} match(es))'
+        )
+    return list(matches[match_index])
+
+
+def load_mol_3d_record(path, record=0, conf_id=0):
+    """Load one 3D structure record from SDF/MOL/PDB/PDBQT."""
+    path = os.path.abspath(path)
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.sdf':
+        supplier = Chem.SDMolSupplier(path, removeHs=False)
+        mol = None
+        for idx, candidate in enumerate(supplier):
+            if idx == record:
+                mol = candidate
+                break
+        if mol is None:
+            raise ValueError(f'Record {record} not found in SDF: {path}')
+    else:
+        if record != 0:
+            raise ValueError(f'record index is only supported for SDF input (got {ext})')
+        mol = load_mol_3d(path)
+    if mol is None:
+        raise ValueError(f'Failed to read molecule from {path}')
+    if mol.GetNumConformers() == 0:
+        raise ValueError(f'No 3D conformer found in {path} record {record}')
+    if conf_id != 0:
+        if conf_id >= mol.GetNumConformers():
+            raise ValueError(
+                f'conf_id {conf_id} out of range (molecule has {mol.GetNumConformers()} conformer(s))'
+            )
+        conf = Chem.Conformer(mol.GetConformer(conf_id))
+        mol = Chem.Mol(mol)
+        mol.RemoveAllConformers()
+        mol.AddConformer(conf, assignId=True)
+    return mol
+
+
+def extract_substructure_3d(mol, smiles, match_index=0, conf_id=0, use_chirality=True):
+    """Extract atoms matching *smiles* from *mol*, preserving 3D coordinates."""
+    query = query_mol_from_smiles(smiles)
+    atom_indices = find_substructure_atom_indices(
+        mol, smiles, match_index=match_index, use_chirality=use_chirality,
+    )
+    subset = subset_mol_preserve_conformer(mol, atom_indices, conf_id=conf_id)
+    try:
+        subset = Chem.AssignBondOrdersFromTemplate(query, subset)
+    except Exception:
+        pass
+    return subset
 
 
 def write_mol_file(mol, path):
@@ -108,6 +218,10 @@ def write_mol_sdf(mol, path):
     if parent:
         os.makedirs(parent, exist_ok=True)
     writer = Chem.SDWriter(str(path))
+    try:
+        writer.SetKekulize(False)
+    except AttributeError:
+        pass
     writer.write(mol)
     writer.close()
 
