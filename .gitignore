@@ -24,3 +24,5 @@ results/
 *.pkl
 *.csv
 *.ckpt
+checkpoints/
+checkpoints

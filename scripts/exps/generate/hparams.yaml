@@ -1,4 +1,4 @@
-model_path: model_v2.ckpt
+model_path: checkpoints/model_v2.ckpt
 num_samples: 100
 linker_design_onestep:
   softmax_temp: 1.2
