@@ -21,6 +21,7 @@ sys.path.append(os.path.realpath('.'))
 from time import time
 import random
 import argparse
+import yaml
 import pandas as pd
 import numpy as np
 from rdkit import Chem
@@ -34,6 +35,10 @@ import sascorer
 
 
 ROOT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+# Placeholder linkers used to seed multi-anchor assemblies (remask rewrites them).
+PLACEHOLDER_LINKER = '[1*]C[1*]'       # 2-valent
+PLACEHOLDER_BRANCH = '[1*]C([1*])[1*]'  # 3-valent (keeps a free handle while chaining)
 
 
 def uses_custom_docking(args):
@@ -67,7 +72,7 @@ def count_attach_points(smiles):
     A valid attachment point is a pendant dummy atom (atomic number 0, degree 1).
     Ring-member dummies (degree != 1) are not usable attachment handles.
     """
-    mol = Chem.MolFromSmiles(smiles)
+    mol = Chem.MolFromSmiles(smiles) if isinstance(smiles, str) else smiles
     if mol is None:
         return 0
     return sum(
@@ -95,6 +100,99 @@ def smiles_without_attach_points(smiles):
         return smiles
 
 
+def _make_star_hub(n_arms):
+    """Build a carbon hub SMILES with *n_arms* pendant [1*] attachment points."""
+    if n_arms < 2:
+        raise ValueError(f'Star hub requires at least 2 arms, got {n_arms}')
+    if n_arms == 2:
+        return PLACEHOLDER_LINKER
+    if n_arms == 3:
+        return PLACEHOLDER_BRANCH
+    if n_arms == 4:
+        return '[1*]C([1*])([1*])[1*]'
+    # n > 4: e.g. n=5 → [1*]C([1*])C([1*])C([1*])[1*]
+    inner = n_arms - 2
+    return '[1*]' + ('C([1*])' * inner) + 'C[1*]'
+
+
+def load_anchor_groups(path):
+    """Load named lists of anchor fragment SMILES from YAML or TSV/TXT.
+
+    YAML::
+        groups:
+          site_A: ['[1*]c1ccccc1', '[1*]c1ccc(F)cc1']
+          site_B: ['[1*]N1CCNCC1']
+
+    TSV/TXT (group_id then SMILES, tab- or whitespace-separated)::
+        site_A	[1*]c1ccccc1
+        site_A	[1*]c1ccc(F)cc1
+        site_B	[1*]N1CCNCC1
+
+    Returns:
+        (group_names, groups) where groups is a list of SMILES lists (same order).
+    """
+    path = os.path.expanduser(path)
+    ext = os.path.splitext(path)[1].lower()
+    ordered = {}
+
+    if ext in ('.yaml', '.yml'):
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f'Anchor groups YAML must be a mapping, got {type(data).__name__}')
+        raw_groups = data.get('groups', data)
+        if not isinstance(raw_groups, dict) or not raw_groups:
+            raise ValueError(
+                'Anchor groups YAML must contain a non-empty "groups" mapping '
+                '(or be a mapping of group_id → list of SMILES)'
+            )
+        for name, frags in raw_groups.items():
+            if isinstance(frags, str):
+                frags = [frags]
+            if not isinstance(frags, (list, tuple)) or not frags:
+                raise ValueError(f'Group {name!r} must be a non-empty list of SMILES')
+            ordered[str(name)] = [str(s).strip() for s in frags if str(s).strip()]
+            if not ordered[str(name)]:
+                raise ValueError(f'Group {name!r} has no valid SMILES')
+    else:
+        with open(path) as f:
+            for lineno, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '\t' in line:
+                    parts = line.split('\t')
+                else:
+                    parts = line.split(None, 1)
+                if len(parts) < 2:
+                    raise ValueError(
+                        f'{path}:{lineno}: expected "group_id SMILES", got {line!r}'
+                    )
+                name, smi = parts[0].strip(), parts[1].strip()
+                ordered.setdefault(name, []).append(smi)
+        if not ordered:
+            raise ValueError(f'No anchor groups found in {path}')
+
+    group_names = list(ordered.keys())
+    groups = [ordered[n] for n in group_names]
+    for name, frags in zip(group_names, groups):
+        for smi in frags:
+            validate_fragment_smiles(smi, f'anchor group {name}')
+            n_pts = count_attach_points(smi)
+            if n_pts < 1:
+                raise ValueError(
+                    f'Anchor in group {name!r} must have at least one pendant [1*] '
+                    f'attachment point, got {smi!r} ({n_pts})'
+                )
+            if n_pts != 1:
+                print(
+                    f'Warning: anchor in group {name!r} has {n_pts} attach points '
+                    f'({smi}); star/chain assembly works best with exactly one exit '
+                    f'vector per sampled fragment.'
+                )
+    return group_names, groups
+
+
 class GenMolOpt():
     def __init__(self, args):
         super().__init__()
@@ -114,6 +212,8 @@ class GenMolOpt():
                 docking_ph=self.args.docking_ph,
                 gnina_seed=self.args.seed,
                 gnina_no_gpu=not self.args.gnina_gpu,
+                reference_smiles=self.args.start_smiles,
+                num_sub_proc=self.args.dock_workers,
             )
             self.ds_column_names = (
                 ['DS'] + [f'DS_{name}' for name in self.predictor.receptor_names[1:]]
@@ -146,7 +246,7 @@ class GenMolOpt():
                 target=self.args.oracle_name,
                 dock_program='vina',
             )
-            self.ds_column_names = ['DS']
+            self.ds_column_names = ['DockingScore']
             run_label = f'{self.args.oracle_name}_id{self.args.start_mol_idx}'
 
         start_mol = Chem.MolFromSmiles(self.start_smiles)
@@ -168,8 +268,23 @@ class GenMolOpt():
                     f'Example linker: [1*]C1CCN([1*])CC1'
                 )
 
+        self.anchor_group_names = None
+        self.anchor_groups = None
+        self.link_mode = getattr(self.args, 'link_mode', 'star')
+        if getattr(self.args, 'anchor_groups', None):
+            self.anchor_group_names, self.anchor_groups = load_anchor_groups(
+                self.args.anchor_groups
+            )
+            sizes = [len(g) for g in self.anchor_groups]
+            print(
+                f'Anchor groups ({self.link_mode}): '
+                + ', '.join(
+                    f'{n}={sz}' for n, sz in zip(self.anchor_group_names, sizes)
+                )
+            )
+
         self.core_mol = None
-        self.protected_smiles = None
+        self.protected_smiles = None  # str | list[str] | None
         if getattr(self.args, 'core_3d', None):
             self.core_mol = load_mol_3d(self.args.core_3d)
             self.protected_smiles = smiles_from_mol(self.core_mol)
@@ -178,7 +293,7 @@ class GenMolOpt():
                 'only peripheral fragments are masked. Gnina input uses ConstrainedEmbed '
                 'from --core_3d.'
             )
-        elif self.init_frag:
+        elif self.init_frag and not self.anchor_groups:
             self.protected_smiles = smiles_without_attach_points(self.init_frag)
 
         self.population = self._build_initial_population()
@@ -187,15 +302,22 @@ class GenMolOpt():
 
         self.fname = f'results/{run_label}_thr{self.args.sim_thr}_{self.args.seed}.csv'
         self.fname = os.path.join(ROOT_DIR, self.fname)
+        if getattr(self.args, 'output', None):
+            out = os.path.expanduser(self.args.output)
+            self.fname = out if os.path.isabs(out) else os.path.join(ROOT_DIR, out)
+            if not self.fname.lower().endswith('.csv'):
+                self.fname = f'{self.fname}.csv'
         base, ext = os.path.splitext(self.fname)
         self.pop_fname = f'{base}_population{ext}'
         print(f'\033[92m{self.fname}\033[0m')
         print(f'\033[92m{self.pop_fname}\033[0m')
 
-        os.makedirs(os.path.dirname(self.fname), exist_ok=True)
+        out_dir = os.path.dirname(self.fname)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         ds_header = ','.join(self.ds_column_names)
         with open(self.fname, 'wt') as f:
-            f.write(f'SMILES,{ds_header},QED,SA,SIM,ref_SMILES\n')
+            f.write(f'iteration,SMILES,{ds_header},QED,SA,Tanimoto_from_ref,ref_SMILES\n')
             if self.custom_docking:
                 start_ds = [
                     str(self.start_ds_by_receptor[name])
@@ -204,30 +326,61 @@ class GenMolOpt():
             else:
                 start_ds = [str(self.start_prop)]
             f.write(
-                f'{self.start_smiles},{",".join(start_ds)},0,0,1,{self.start_smiles}\n'
+                f'0,{self.start_smiles},{",".join(start_ds)},0,0,1,{self.start_smiles}\n'
             )
         with open(self.pop_fname, 'wt') as f:
-            f.write('iteration,rank,DS,fragment\n')
+            if self.anchor_groups:
+                f.write('iteration,rank,DockingScore,group,fragment\n')
+            else:
+                f.write('iteration,rank,DockingScore,fragment\n')
         self.record_population(0)
 
     def _build_initial_population(self):
         frags = set()
-        if self.args.fragments_file:
-            frags |= load_fragments(self.args.fragments_file)
-            print(f'Loaded {len(frags)} fragments from {self.args.fragments_file}')
-        if self.args.fragments_file is None or self.args.self_fragment:
-            start_frags = cut(self.start_smiles)
-            print(f'Cut start_smiles into {len(start_frags)} fragments')
-            frags |= start_frags
-        # The linker (init_frag) is force-inserted at generation time, so it must not
-        # also be sampled as a side fragment; keep it out of the population.
-        if self.init_frag:
-            frags.discard(self.init_frag)
+
+        if self.anchor_groups:
+            # Population mirrors the mandatory anchor pools (not cut(start_smiles)).
+            for group in self.anchor_groups:
+                frags |= set(group)
+            print(
+                f'Seeded population from {len(self.anchor_groups)} anchor groups '
+                f'({len(frags)} unique fragments)'
+            )
+            if self.args.fragments_file:
+                extra = load_fragments(self.args.fragments_file)
+                frags |= extra
+                print(f'Added {len(extra)} fragments from {self.args.fragments_file}')
+            if self.args.self_fragment:
+                start_frags = cut(self.start_smiles)
+                frags |= start_frags
+                print(f'Added {len(start_frags)} fragments from cut(start_smiles)')
+        else:
+            if self.args.fragments_file:
+                frags |= load_fragments(self.args.fragments_file)
+                print(f'Loaded {len(frags)} fragments from {self.args.fragments_file}')
+            if self.args.fragments_file is None or self.args.self_fragment:
+                start_frags = cut(self.start_smiles)
+                print(f'Cut start_smiles into {len(start_frags)} fragments')
+                frags |= start_frags
+            # The linker (init_frag) is force-inserted at generation time, so it must not
+            # also be sampled as a side fragment; keep it out of the population.
+            if self.init_frag:
+                frags.discard(self.init_frag)
+
         if not frags:
             raise ValueError('Initial fragment population is empty')
         self.population = [(self.start_prop, frag) for frag in frags]
         self._dedupe_population()
         return self.population
+
+    def _population_score_lookup(self):
+        """Map canonical fragment SMILES → best DockingScore in the population."""
+        lookup = {}
+        for ds, frag in self.population:
+            key = self._fragment_key(frag)
+            if key not in lookup or ds > lookup[key]:
+                lookup[key] = ds
+        return lookup
 
     def _fragment_key(self, frag):
         mol = Chem.MolFromSmiles(frag)
@@ -306,22 +459,121 @@ class GenMolOpt():
             return None
         return self.attach(mol, frag2)
 
+    def _count_dummy(self, mol):
+        if isinstance(mol, str):
+            return count_attach_points(mol)
+        return count_attach_points(Chem.MolToSmiles(mol)) if mol is not None else 0
+
+    def assemble_anchors_star(self, anchors):
+        """Join mono-/multi-valent anchors via a central placeholder hub."""
+        if len(anchors) < 2:
+            return None
+        hub = _make_star_hub(len(anchors))
+        mol = hub
+        for anchor in anchors:
+            mol = self.attach(mol, anchor)
+            if mol is None:
+                return None
+        if self._has_dummy(mol):
+            return None
+        return mol
+
+    def assemble_anchors_chain(self, anchors):
+        """Join anchors in order with placeholder linkers (A-L-B-L-C...)."""
+        if len(anchors) < 2:
+            return None
+        mol = anchors[0]
+        for idx, anchor in enumerate(anchors[1:]):
+            remaining_after = len(anchors) - 2 - idx
+            if remaining_after > 0:
+                mol = self.attach(mol, PLACEHOLDER_BRANCH)
+                if mol is None:
+                    return None
+                mol = self.attach(mol, anchor)
+                if mol is None:
+                    return None
+            else:
+                linker = (
+                    PLACEHOLDER_LINKER
+                    if self._count_dummy(mol) == 1
+                    else PLACEHOLDER_BRANCH
+                )
+                mol = self.attach(mol, linker)
+                if mol is None:
+                    return None
+                mol = self.attach(mol, anchor)
+                if mol is None:
+                    return None
+        if self._has_dummy(mol):
+            return None
+        return mol
+
+    def assemble_anchors(self, anchors):
+        if self.link_mode == 'chain':
+            return self.assemble_anchors_chain(anchors)
+        return self.assemble_anchors_star(anchors)
+
+    @staticmethod
+    def _as_protected_list(protected):
+        if protected is None:
+            return []
+        if isinstance(protected, str):
+            return [protected]
+        return [s for s in protected if s]
+
+    def _protection_for_anchors(self, anchors):
+        """Protected substructures: stripped anchors (+ optional core_3d)."""
+        protected = [smiles_without_attach_points(a) for a in anchors]
+        if self.core_mol is not None:
+            core_smi = smiles_from_mol(self.core_mol)
+            if core_smi not in protected:
+                protected.insert(0, core_smi)
+        return protected
+
+    def _contains_all_cores(self, smiles, cores):
+        for core in cores:
+            core_mol = Chem.MolFromSmiles(core) if isinstance(core, str) else core
+            if core_mol is None:
+                continue
+            if not mol_contains_core(smiles, core_mol):
+                return False
+        return True
+
     def update_population(self, smiles_list, prop_list):
         rv_list, ds_by_receptor, rq_list, rs_list, rsim_list = prop_list
         for rv, rq, rs, rsim, smiles in zip(rv_list, rq_list, rs_list, rsim_list, smiles_list):
             if rv > self.start_prop and rq >= 0.6 and rs >= 6/9 and rsim >= self.args.sim_thr:
-                frags = {frag for frag in cut(smiles)}
-                self.population.extend([(rv, frag) for frag in frags])
+                if self.anchor_groups:
+                    # Keep the pool = anchor fragments; bump score when an anchor
+                    # appears in a winning molecule (do not inject cut() pieces).
+                    for group in self.anchor_groups:
+                        for smi in group:
+                            core = smiles_without_attach_points(smi)
+                            core_mol = Chem.MolFromSmiles(core)
+                            if core_mol is not None and mol_contains_core(smiles, core_mol):
+                                self.population.append((rv, smi))
+                else:
+                    frags = {frag for frag in cut(smiles)}
+                    self.population.extend([(rv, frag) for frag in frags])
         self._dedupe_population()
 
     def generate(self):
         for _ in range(1000):
-            pop_frags = [frag for prop, frag in self.population]
-            frag1, frag2 = random.sample(pop_frags, 2)
-            if self.init_frag:
-                mol = self.attach_linker(self.init_frag, frag1, frag2)
+            if self.anchor_groups:
+                anchors = [random.choice(group) for group in self.anchor_groups]
+                mol = self.assemble_anchors(anchors)
+                protected = self._protection_for_anchors(anchors)
             else:
-                mol = self.attach(frag1, frag2)
+                pop_frags = [frag for prop, frag in self.population]
+                if len(pop_frags) < 2:
+                    return None
+                frag1, frag2 = random.sample(pop_frags, 2)
+                if self.init_frag:
+                    mol = self.attach_linker(self.init_frag, frag1, frag2)
+                else:
+                    mol = self.attach(frag1, frag2)
+                protected = self.protected_smiles
+
             if mol is None:
                 continue
             if self._has_dummy(mol):
@@ -334,7 +586,7 @@ class GenMolOpt():
                     smiles,
                     min_len=50,
                     gamma=self.args.gamma,
-                    protected_smiles=self.protected_smiles,
+                    protected_smiles=protected,
                 )
             except Exception:
                 continue
@@ -344,19 +596,39 @@ class GenMolOpt():
                 new_smiles = smiles
             if self.core_mol is not None and not mol_contains_core(new_smiles, self.core_mol):
                 continue
-            if self.protected_smiles and self.core_mol is None:
-                prot_mol = Chem.MolFromSmiles(self.protected_smiles)
-                if prot_mol is not None and not mol_contains_core(new_smiles, prot_mol):
+            if self.anchor_groups:
+                anchor_cores = [smiles_without_attach_points(a) for a in anchors]
+                if not self._contains_all_cores(new_smiles, anchor_cores):
+                    continue
+            elif protected and self.core_mol is None:
+                rejected = False
+                for prot in self._as_protected_list(protected):
+                    prot_mol = Chem.MolFromSmiles(prot)
+                    if prot_mol is not None and not mol_contains_core(new_smiles, prot_mol):
+                        rejected = True
+                        break
+                if rejected:
                     continue
             return new_smiles
         return None
 
     def record_population(self, iteration):
         with open(self.pop_fname, 'a') as f:
-            for rank, (ds, frag) in enumerate(self.population, start=1):
-                f.write(f'{iteration},{rank},{ds},{frag}\n')
+            if self.anchor_groups:
+                score_lookup = self._population_score_lookup()
+                rows = []
+                for name, group in zip(self.anchor_group_names, self.anchor_groups):
+                    for frag in group:
+                        ds = score_lookup.get(self._fragment_key(frag), self.start_prop)
+                        rows.append((ds, name, frag))
+                rows.sort(key=lambda r: r[0], reverse=True)
+                for rank, (ds, name, frag) in enumerate(rows, start=1):
+                    f.write(f'{iteration},{rank},{ds},{name},{frag}\n')
+            else:
+                for rank, (ds, frag) in enumerate(self.population, start=1):
+                    f.write(f'{iteration},{rank},{ds},{frag}\n')
 
-    def record(self, smiles_list, prop_list):
+    def record(self, smiles_list, prop_list, iteration):
         rv_list, ds_by_receptor, rq_list, rs_list, rsim_list = prop_list
         with open(self.fname, 'a') as f:
             for i, smiles in enumerate(smiles_list):
@@ -366,19 +638,27 @@ class GenMolOpt():
                         for name in self.predictor.receptor_names
                     ]
                     f.write(
-                        f'{smiles},{",".join(ds_vals)},{rq_list[i]},{rs_list[i]},'
-                        f'{rsim_list[i]},{self.start_smiles}\n'
+                        f'{iteration},{smiles},{",".join(ds_vals)},{rq_list[i]},'
+                        f'{rs_list[i]},{rsim_list[i]},{self.start_smiles}\n'
                     )
 
     def run(self):
         t_start = time()
         for i in range(self.args.num_iter):
-            self.record_population(i + 1)
+            iteration = i + 1
+            self.record_population(iteration)
             smiles_list = [s for s in (self.generate() for _ in range(self.args.num_gen)) if s]
             n_failed = self.args.num_gen - len(smiles_list)
             if n_failed:
-                print(f'[Iter {i+1:03d}] {n_failed}/{self.args.num_gen} fragment assemblies failed')
+                print(f'[Iter {iteration:03d}] {n_failed}/{self.args.num_gen} fragment assemblies failed')
             if not smiles_list:
+                if self.anchor_groups:
+                    raise RuntimeError(
+                        'No molecule could be assembled from --anchor_groups. '
+                        'Each group is sampled once per candidate; fragments need pendant '
+                        f'[1*] points and must remain after remask (link_mode={self.link_mode}). '
+                        'Check attachment points and consider lowering --gamma.'
+                    )
                 if self.core_mol is not None:
                     raise RuntimeError(
                         'No generated molecule preserved the --core_3d substructure after the '
@@ -396,8 +676,8 @@ class GenMolOpt():
                 continue
             prop_list = self.reward(smiles_list)
             self.update_population(smiles_list, prop_list)
-            self.record(smiles_list, prop_list)
-            print(f'[Iter {i+1:03d}] Top DS: {self.population[0][0]}')
+            self.record(smiles_list, prop_list, iteration)
+            print(f'[Iter {iteration:03d}] Top DS: {self.population[0][0]}')
         print(f'{time() - t_start:.2f} sec elapsed')
 
 
@@ -428,13 +708,32 @@ def validate_args(parser, args):
 
     if args.fragments_file and not os.path.exists(args.fragments_file):
         parser.error(f'Fragments file not found: {args.fragments_file}')
+
+    if args.anchor_groups:
+        if not os.path.exists(args.anchor_groups):
+            parser.error(f'Anchor groups file not found: {args.anchor_groups}')
+        if args.init_frag:
+            parser.error(
+                '--anchor_groups and --init_frag are mutually exclusive. '
+                'Use --anchor_groups for multi-site mandatory fragments; '
+                'use --init_frag for the classic two-sided linker mode.'
+            )
+        try:
+            names, groups = load_anchor_groups(args.anchor_groups)
+        except (ValueError, yaml.YAMLError) as e:
+            parser.error(f'Invalid --anchor_groups file: {e}')
+        if len(groups) < 2:
+            parser.error('--anchor_groups requires at least 2 groups to link together')
+        print(f'Validated {len(groups)} anchor groups: {", ".join(names)}')
+
     core_mol = None
     if args.core_3d:
         if not os.path.exists(args.core_3d):
             parser.error(f'Core 3D file not found: {args.core_3d}')
         try:
             core_mol = load_mol_3d(args.core_3d)
-            if not args.init_frag:
+            # Do not auto-derive init_frag when using anchor_groups (different assembly mode).
+            if not args.init_frag and not args.anchor_groups:
                 args.init_frag = smiles_from_mol(core_mol)
                 print(f'Note: --init_frag derived from --core_3d: {args.init_frag}')
         except Exception as e:
@@ -497,7 +796,12 @@ if __name__ == '__main__':
         type=str,
         nargs='+',
         default=None,
-        help='One or more aligned receptor PDB/PDBQT files; first is used for selection',
+        help=(
+            'One or more aligned receptor PDBs (gnina: co-crystal ligand stripped). '
+            'First receptor is the reference protein (pose_1); later receptors are '
+            'addons that minimize from pose_1 to score affinity in the same area. '
+            'First receptor is used for selection.'
+        ),
     )
     parser.add_argument(
         '--start_smiles',
@@ -546,13 +850,46 @@ if __name__ == '__main__':
              'between two sampled fragments at each generation',
     )
     parser.add_argument(
+        '--anchor_groups',
+        type=str,
+        default=None,
+        help=(
+            'YAML or TSV of mandatory anchor groups. Each generation samples one fragment '
+            'from every group and links them (see --link_mode). Mutually exclusive with '
+            '--init_frag. YAML: groups: {site_A: ["[1*]c1ccccc1", ...], ...}. '
+            'TSV: group_id<TAB>SMILES per line.'
+        ),
+    )
+    parser.add_argument(
+        '--output',
+        type=str,
+        default=None,
+        help=(
+            'Output CSV path for generated molecules (default: '
+            'results/<run>_thr<sim>_<seed>.csv under scripts/exps/lead/). '
+            'A sibling *_population.csv is written next to it.'
+        ),
+    )
+    parser.add_argument(
+        '--link_mode',
+        type=str,
+        default='star',
+        choices=['star', 'chain'],
+        help=(
+            'How to join --anchor_groups samples before remask: '
+            '"star" = central placeholder hub (default); '
+            '"chain" = ordered A-L-B-L-C with placeholder linkers'
+        ),
+    )
+    parser.add_argument(
         '--core_3d',
         type=str,
         default=None,
         help=(
             'SDF/MOL/PDB/PDBQT with a 3D substructure pose; '
             'ligands are placed via RDKit ConstrainedEmbed before docking. '
-            'If --init_frag is omitted, SMILES are derived from this file'
+            'If --init_frag is omitted (and --anchor_groups is not set), '
+            'SMILES are derived from this file'
         ),
     )
     parser.add_argument(
@@ -564,7 +901,19 @@ if __name__ == '__main__':
     parser.add_argument(
         '--gnina_gpu',
         action='store_true',
-        help='Enable GPU acceleration for gnina local minimize (default: CPU only)',
+        help=(
+            'Enable GPU for gnina (default: CPU only). Always uses a single dock '
+            'worker; --dock_workers is ignored.'
+        ),
+    )
+    parser.add_argument(
+        '--dock_workers',
+        type=int,
+        default=None,
+        help=(
+            'Parallel docking workers for CPU docking (default: 1 for gnina, 10 for '
+            'vina/unidock). Ignored when --gnina_gpu is set.'
+        ),
     )
     args = parser.parse_args()
     validate_args(parser, args)

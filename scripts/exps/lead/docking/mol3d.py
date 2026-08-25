@@ -203,6 +203,15 @@ def extract_substructure_3d(mol, smiles, match_index=0, conf_id=0, use_chirality
     return subset
 
 
+def load_first_pose_from_sdf(path):
+    """Load the first valid 3D molecule from an SDF file."""
+    supplier = Chem.SDMolSupplier(str(path), removeHs=False)
+    for mol in supplier:
+        if mol is not None and mol.GetNumConformers() > 0:
+            return mol
+    raise ValueError(f'No 3D pose found in {path}')
+
+
 def write_mol_file(mol, path):
     """Write an RDKit mol with 3D coordinates to a .mol file."""
     if mol.GetNumConformers() == 0:
@@ -260,15 +269,37 @@ def translate_mol_centroid_to_point(mol, target_xyz):
     return out
 
 
-def build_initial_mol_for_gnina(smiles, core_mol=None, box_center=None, random_seed=0, ph=DEFAULT_DOCKING_PH):
+def build_initial_mol_for_gnina(
+    smiles,
+    core_mol=None,
+    ref_ligand_mol=None,
+    box_center=None,
+    random_seed=0,
+    ph=DEFAULT_DOCKING_PH,
+):
     """
     Build a protonated 3D ligand for gnina local minimize.
 
-    With core_mol: ConstrainedEmbed then protonate preserving pose.
-    Without core_mol: embed from SMILES, translate centroid to box_center, protonate.
+    Priority:
+    1. core_mol: ConstrainedEmbed (explicit --core_3d pose)
+    2. ref_ligand_mol: crystal pose if SMILES matches, else MCS+Kabsch align
+    3. otherwise: embed from SMILES and translate heavy-atom centroid to box_center
     """
     if core_mol is not None:
         raw = constrained_embed_smiles(smiles, core_mol, random_seed=random_seed)
+    elif ref_ligand_mol is not None:
+        from .receptor_prep import assign_bond_orders_from_smiles, mol_matches_smiles_stereo_insensitive
+        from .pose_align import align_smiles_conformer_to_reference_ligand
+
+        if mol_matches_smiles_stereo_insensitive(ref_ligand_mol, smiles):
+            raw = assign_bond_orders_from_smiles(ref_ligand_mol, smiles)
+            if raw is None:
+                raw = Chem.Mol(ref_ligand_mol)
+        else:
+            smiles_mol = smiles_to_docking_mol_3d(smiles, ph=ph)
+            if smiles_mol is None:
+                raise ValueError(f'Could not build 3D structure from SMILES: {smiles}')
+            raw, _, _ = align_smiles_conformer_to_reference_ligand(smiles_mol, ref_ligand_mol)
     else:
         raw = smiles_to_docking_mol_3d(smiles, ph=ph)
         if raw is None:

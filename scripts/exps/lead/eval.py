@@ -24,17 +24,33 @@ if __name__ == '__main__':
     parser.add_argument('-d', '--sim_thr', type=float, default=0.4)
     args = parser.parse_args()
 
-    df = pd.read_csv(args.file, names=['smiles', 'DS', 'QED', 'SA', 'SIM', ''])
+    df = pd.read_csv(args.file)
+    # Support both legacy (no iteration) and current headers.
+    colmap = {c.lower(): c for c in df.columns}
+    smiles_col = colmap.get('smiles')
+    ds_col = colmap.get('ds') or colmap.get('dockingscore')
+    qed_col = colmap.get('qed')
+    sa_col = colmap.get('sa')
+    sim_col = colmap.get('sim') or colmap.get('tanimoto_from_ref')
+    if not all([smiles_col, ds_col, qed_col, sa_col, sim_col]):
+        # Legacy files without a header row
+        df = pd.read_csv(
+            args.file,
+            names=['smiles', 'DS', 'QED', 'SA', 'SIM', 'ref'],
+            header=None,
+        )
+        smiles_col, ds_col, qed_col, sa_col, sim_col = 'smiles', 'DS', 'QED', 'SA', 'SIM'
+
     num_gen = 1000  # len(df)
-    df = df.drop_duplicates(subset=['smiles'])
+    df = df.drop_duplicates(subset=[smiles_col])
     print(f'Uniqueness:\t{len(df) / num_gen}')
-    
-    df = df[df['SIM'] >= args.sim_thr]
-    df = df[df['QED'] >= 0.6]
-    df = df[df['SA'] >= 6 / 9]
+
+    df = df[df[sim_col] >= args.sim_thr]
+    df = df[df[qed_col] >= 0.6]
+    df = df[df[sa_col] >= 6 / 9]
     if not len(df):
         print('Lead optimization failed')
     else:
-        df = df.sort_values(by='DS', ascending=False)
-        print(f'Top DS:\t\t{(df["DS"].iloc[0])}')
-        print(f'Top mol:\t{(df["smiles"].iloc[0])}')
+        df = df.sort_values(by=ds_col, ascending=False)
+        print(f'Top DS:\t\t{(df[ds_col].iloc[0])}')
+        print(f'Top mol:\t{(df[smiles_col].iloc[0])}')

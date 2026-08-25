@@ -166,13 +166,32 @@ class Sampler:
             return filter_by_substructure(samples, fragment)
         return samples
 
+    @staticmethod
+    def _as_protected_list(protected_smiles):
+        """Normalize protected_smiles to a list of SMILES, or None."""
+        if protected_smiles is None:
+            return None
+        if isinstance(protected_smiles, str):
+            return [protected_smiles]
+        return [s for s in protected_smiles if s]
+
     def _safe_fragment_indices_matching(self, smiles, protected_smiles):
-        """Return SAFE fragment indices whose decoded SMILES overlap *protected_smiles*."""
+        """Return SAFE fragment indices overlapping any entry in *protected_smiles*.
+
+        *protected_smiles* may be a single SMILES string or a list of SMILES.
+        """
         encoded = sf.SAFEConverter(slicer=self.slicer, ignore_stereo=True).encoder(
             smiles, allow_empty=True,
         )
-        protected = Chem.MolFromSmiles(protected_smiles)
-        if protected is None:
+        protected_list = self._as_protected_list(protected_smiles)
+        if not protected_list:
+            return set()
+        protected_mols = []
+        for smi in protected_list:
+            mol = Chem.MolFromSmiles(smi)
+            if mol is not None:
+                protected_mols.append(mol)
+        if not protected_mols:
             return set()
         protected_idx = set()
         for i, frag in enumerate(encoded.split('.')):
@@ -182,11 +201,13 @@ class Sampler:
             frag_mol = Chem.MolFromSmiles(frag_smi)
             if frag_mol is None:
                 continue
-            if (
-                frag_mol.HasSubstructMatch(protected)
-                or protected.HasSubstructMatch(frag_mol)
-            ):
-                protected_idx.add(i)
+            for protected in protected_mols:
+                if (
+                    frag_mol.HasSubstructMatch(protected)
+                    or protected.HasSubstructMatch(frag_mol)
+                ):
+                    protected_idx.add(i)
+                    break
         return protected_idx
 
     def mask_modification(self, smiles, min_len=30, protected_smiles=None, **kwargs):
@@ -206,8 +227,12 @@ class Sampler:
             samples = self.fragment_completion(smiles, mask_len=num_edit, apply_filter=False, **kwargs)
         except:
             return smiles
-        if protected_smiles is not None and samples:
-            samples = filter_by_substructure(samples, protected_smiles)
+        protected_list = self._as_protected_list(protected_smiles)
+        if protected_list and samples:
+            for prot in protected_list:
+                samples = filter_by_substructure(samples, prot)
+                if not samples:
+                    break
         if samples:
             return samples[0]
         return smiles
