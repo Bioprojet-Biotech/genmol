@@ -210,6 +210,53 @@ class Sampler:
                     break
         return protected_idx
 
+    def _map_safe_fragments_to_atoms(self, smiles, mol=None):
+        """Map each SAFE fragment to heavy-atom indices in *mol* (greedy, unused-first).
+
+        Returns a list of tuples (one per SAFE fragment). Atoms are indices into
+        *mol*, which defaults to ``Chem.MolFromSmiles(smiles)``.
+        """
+        if mol is None:
+            mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            raise ValueError(f'Invalid SMILES for fragment mapping: {smiles}')
+        encoded = sf.SAFEConverter(slicer=self.slicer, ignore_stereo=True).encoder(
+            smiles, allow_empty=True,
+        )
+        assigned = set()
+        mapping = []
+        for frag in encoded.split('.'):
+            frag_smi = sf.decode(frag, canonical=True, ignore_errors=True)
+            if frag_smi is None:
+                mapping.append(())
+                continue
+            frag_mol = Chem.MolFromSmiles(frag_smi)
+            if frag_mol is None:
+                mapping.append(())
+                continue
+            matches = mol.GetSubstructMatches(frag_mol)
+            best = None
+            for match in matches:
+                if not set(match) & assigned:
+                    best = match
+                    break
+            if best is None and matches:
+                best = matches[0]
+            if best is None:
+                mapping.append(())
+                continue
+            assigned.update(best)
+            mapping.append(tuple(best))
+        return mapping
+
+    def _safe_fragment_indices_overlapping_atoms(self, smiles, atom_indices, mol=None):
+        """Return SAFE fragment indices that overlap any of *atom_indices*."""
+        target = set(int(i) for i in atom_indices)
+        if not target:
+            return set()
+        mapping = self._map_safe_fragments_to_atoms(smiles, mol=mol)
+        return {i for i, atoms in enumerate(mapping) if target & set(atoms)}
+
     def mask_modification(self, smiles, min_len=30, protected_smiles=None, **kwargs):
         encoded_smiles = sf.SAFEConverter(slicer=self.slicer, ignore_stereo=True).encoder(smiles, allow_empty=True)
         x = self.model.tokenizer([encoded_smiles],
@@ -237,7 +284,21 @@ class Sampler:
             return samples[0]
         return smiles
     
-    def remask(self, smiles, input_ids=None, protected_smiles=None, **kwargs):
+    def remask(self, smiles, input_ids=None, protected_smiles=None,
+               mask_frag_indices=None, mask_all=False, **kwargs):
+        """Remask one or more SAFE fragments and decode.
+
+        Args:
+            smiles: Input molecule SMILES.
+            input_ids: Optional pre-tokenized SAFE sequence.
+            protected_smiles: Fragment(s) that must not be remasked. Ignored when
+                *mask_frag_indices* is set.
+            mask_frag_indices: Explicit SAFE fragment indices to remask (e.g. from
+                substructure inpainting). When set, only these fragments are candidates.
+            mask_all: If True and multiple candidates exist, remask all of them in
+                one pass (FLOWR-style region inpainting). If False, remask one
+                randomly chosen candidate.
+        """
         x = input_ids
         if x is None:
             encoded_smiles = sf.SAFEConverter(slicer=self.slicer, ignore_stereo=True).encoder(smiles, allow_empty=True)
@@ -249,23 +310,98 @@ class Sampler:
         # fragment mask replacement
         special_token_idx = [0] + (x[0] == self.dot_index).nonzero(as_tuple=True)[0].tolist() + [len(x[0]) - 1]
         n_frags = len(special_token_idx) - 1
-        if protected_smiles is not None:
+        if mask_frag_indices is not None:
+            candidates = sorted({int(i) for i in mask_frag_indices if 0 <= int(i) < n_frags})
+            if not candidates:
+                return smiles
+        elif protected_smiles is not None:
             protected_idx = self._safe_fragment_indices_matching(smiles, protected_smiles)
             candidates = [i for i in range(n_frags) if i not in protected_idx]
             if not candidates:
                 return smiles
-            frag_idx = random.choice(candidates)
         else:
-            frag_idx = random.randint(0, n_frags - 1)
-        mask_start_idx = special_token_idx[frag_idx] + 1
-        mask_end_idx = special_token_idx[frag_idx + 1]
-        num_insert_mask = random.randint(5, 15)
-        num_insert_mask = min(num_insert_mask,
-                              self.model.config.model.max_position_embeddings - x.shape[-1] + mask_end_idx - mask_start_idx)
-        x = torch.hstack([x[:, :mask_start_idx],
-                          torch.full((1, num_insert_mask), self.model.mask_index),
-                          x[:, mask_end_idx:]])
+            candidates = list(range(n_frags))
+            if not candidates:
+                return smiles
+
+        if mask_all and len(candidates) > 1:
+            frags_to_mask = sorted(candidates, reverse=True)
+        else:
+            frags_to_mask = [random.choice(candidates)]
+
+        for frag_idx in frags_to_mask:
+            special_token_idx = (
+                [0]
+                + (x[0] == self.dot_index).nonzero(as_tuple=True)[0].tolist()
+                + [len(x[0]) - 1]
+            )
+            if frag_idx + 1 >= len(special_token_idx):
+                continue
+            mask_start_idx = special_token_idx[frag_idx] + 1
+            mask_end_idx = special_token_idx[frag_idx + 1]
+            num_insert_mask = random.randint(5, 15)
+            num_insert_mask = min(
+                num_insert_mask,
+                self.model.config.model.max_position_embeddings - x.shape[-1]
+                + mask_end_idx - mask_start_idx,
+            )
+            if num_insert_mask < 1:
+                continue
+            x = torch.hstack([
+                x[:, :mask_start_idx],
+                torch.full((1, num_insert_mask), self.model.mask_index),
+                x[:, mask_end_idx:],
+            ])
         samples = self.generate(x, **kwargs)
         if samples:
             return samples[0]
         return smiles
+
+    def inpaint(self, smiles, mask_atom_indices=None, mol=None,
+                num_samples=1, mask_all=True, keep_smiles=None, **kwargs):
+        """Inpaint SAFE fragments that overlap *mask_atom_indices*.
+
+        Args:
+            smiles: Molecule SMILES used for SAFE encoding / generation.
+            mask_atom_indices: Heavy-atom indices (into *mol* or MolFromSmiles(smiles))
+                that should be changed — FLOWR ``--substructure`` semantics.
+            mol: Optional RDKit mol whose atom indices match *mask_atom_indices*.
+            num_samples: Number of independent remask draws.
+            mask_all: Remask all overlapping SAFE fragments in one pass.
+            keep_smiles: Optional SMILES / list used to filter completions that
+                still contain the kept region (``--filter_cond_substructure``).
+        """
+        if not mask_atom_indices:
+            raise ValueError('mask_atom_indices must be a non-empty list of atom indices')
+        if mol is None:
+            mol = Chem.MolFromSmiles(smiles)
+        frag_idx = self._safe_fragment_indices_overlapping_atoms(
+            smiles, mask_atom_indices, mol=mol,
+        )
+        if not frag_idx:
+            raise ValueError(
+                'No SAFE fragment overlaps the requested mask atoms; '
+                'check --substructure indices against the heavy-atom molecule.'
+            )
+        keep_list = self._as_protected_list(keep_smiles)
+        samples = []
+        for _ in range(num_samples):
+            sample = self.remask(
+                smiles,
+                mask_frag_indices=frag_idx,
+                mask_all=mask_all,
+                **kwargs,
+            )
+            if not sample or sample == smiles:
+                continue
+            if keep_list:
+                filtered = [sample]
+                for prot in keep_list:
+                    filtered = filter_by_substructure(filtered, prot)
+                    if not filtered:
+                        break
+                if not filtered:
+                    continue
+                sample = filtered[0]
+            samples.append(sample)
+        return samples

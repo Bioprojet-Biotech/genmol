@@ -1,0 +1,8 @@
+model_path: checkpoints/model_v2.ckpt
+num_samples: 100
+inpainting:
+  softmax_temp: 1.2
+  randomness: 2
+  gamma: 0
+  # Remask all SAFE fragments overlapping --substructure in one pass (FLOWR-like).
+  mask_all: true
